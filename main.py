@@ -1,213 +1,153 @@
-from sklearn.metrics import mean_squared_error
-import backtrader as bt
-from datetime import datetime
-from ib_insync import *
-import pandas as pd
+import math
+import os
+from tempfile import TemporaryDirectory
+from typing import Tuple
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
-import numpy as np
-import joblib
-import matplotlib
-
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-    # 3 input features: year, day_of_year, and open GO up to 2048
-        self.fc1 = nn.Linear(6, 128)  # Input layer
-        self.fc2 = nn.Linear(128, 256)  # Hidden layer
-        self.fc3 = nn.Linear(256, 512)  # Hidden layer
-        self.fc4 = nn.Linear(512, 1024)  # Additional hidden layer
-        self.fc5 = nn.Linear(1024, 2048)  # Additional hidden layer
-        self.fc6 = nn.Linear(2048, 1024)
-        self.fc7 = nn.Linear(1024, 512)
-        self.fc8 = nn.Linear(512, 256)
-        self.fc9 = nn.Linear(256, 128)
-        self.fc10 = nn.Linear(128, 64)
-        self.fc11 = nn.Linear(64, 3)
+from torch import nn, Tensor
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.utils.data import DataLoader, Dataset
 
 
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = torch.relu(self.fc3(x))
-        x = torch.relu(self.fc4(x))
-        x = torch.relu(self.fc5(x))
-        x = torch.relu(self.fc6(x))
-        x = torch.relu(self.fc7(x))
-        
-        x = torch.relu(self.fc8(x))
-        x = torch.relu(self.fc9(x))
-        x = torch.relu(self.fc10(x))
-        
-        x = self.fc11(x)
-        
-        
-        return x
+class TransformerModel(nn.Module):
+
+    def __init__(self, ntoken: int, d_model: int, nhead: int, d_hid: int,
+                 nlayers: int, dropout: float = 0.5):
+        super().__init__()
+        self.model_type = 'Transformer'
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layers = TransformerEncoderLayer(
+            d_model, nhead, d_hid, dropout)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.embedding = nn.Embedding(ntoken, d_model)
+        self.d_model = d_model
+        self.linear = nn.Linear(d_model, ntoken)
+
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        initrange = 0.1
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.linear.bias.data.zero_()
+        self.linear.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, src: Tensor, src_mask: Tensor = None) -> Tensor:
+        """
+        Arguments:
+            src: Tensor, shape ``[seq_len, batch_size]``
+            src_mask: Tensor, shape ``[seq_len, seq_len]``
+
+        Returns:
+            output Tensor of shape ``[seq_len, batch_size, ntoken]``
+        """
+        src = self.embedding(src) * math.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+        if src_mask is None:
+            """Generate a square causal mask for the sequence. The masked positions are filled with float('-inf').
+            Unmasked positions are filled with float(0.0).
+            """
+            src_mask = nn.Transformer.generate_square_subsequent_mask(
+                len(src)).to(device)
+        output = self.transformer_encoder(src, src_mask)
+        output = self.linear(output)
+        return output
 
 
-def TrainNewModel(csv_file, modelId):
-    print("====================================")
-    print("Loading historical data...")
-    df = pd.read_csv(f"./{csv_file}")
-    
-    #Date,Symbol,Open,High,Low,Close,Volume ETH,Volume USD
-    cuda_available = torch.cuda.is_available()
-    print("CUDA Available:", cuda_available)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-    # Convert 'date' column to datetime (ensure your CSV's date format is recognized by pandas)
-    df['date'] = pd.to_datetime(df['date'], utc=True)
-    df['year'] = df['date'].dt.year
-    df['day_of_year'] = df['date'].dt.dayofyear
-    df['prev_close'] = df['close'].shift(1)
-    df['prev_high'] = df['high'].shift(1)
-    df['prev_low'] = df['low'].shift(1)
+class PositionalEncoding(nn.Module):
 
-    df.dropna(inplace=True)
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-    # save
-    # Prepare input and output data
-    X = df[['year', 'day_of_year', 'open',
-            'prev_close', 'prev_high', 'prev_low']].values
-    y = df[['high', 'low', "close"]].values
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2)
+                             * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
-    # Scale data
-    scaler_X = MinMaxScaler()
-    scaler_y = MinMaxScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y)
-    # save the scaler
-    scaler_X_path = (f"./{modelId}_scaler_X.pkl")
-    scaler_y_path = (f"./{modelId}_scaler_y.pkl")
-    joblib.dump(scaler_X, scaler_X_path)
-    joblib.dump(scaler_y, scaler_y_path)
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42)
 
-    # Convert to PyTorch tensors
-    X_train = torch.tensor(X_train, dtype=torch.float32)
-    X_test = torch.tensor(X_test, dtype=torch.float32)
-    y_train = torch.tensor(y_train, dtype=torch.float32)
-    y_test = torch.tensor(y_test, dtype=torch.float32)
+class TokenizedTextDataset(Dataset):
+    """A Dataset class that holds tokenized text data."""
 
-    # Define the model
+    def __init__(self, data, vocab):
+        self.data = data
+        self.vocab = vocab
 
-    model = Net().to(device)
+    def __len__(self):
+        return len(self.data)
 
-    # Loss and optimizer
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=50, gamma=0.9)
-    print("====================================")
-    print("Training the model...")
-# Train the model
-    for epoch in range(2000):  # number of epochs
-        inputs, labels = X_train.to(device), y_train.to(device)
-        optimizer.zero_grad()
-        output = model(inputs)
-        loss = criterion(output, labels)
-        loss.backward()
+    def __getitem__(self, idx):
+        token_ids = [self.vocab[token] if token in self.vocab else self.vocab["<unk>"]
+                     for token in self.data[idx]]
+        return torch.tensor(token_ids, dtype=torch.long)
 
-        optimizer.step()
-        scheduler.step()
 
-        if epoch % 100 == 99:
-            print(f'Epoch {epoch+1}, Loss: {loss.item()}')
+def collate_batch(batch):
+    """A function to collate data into batches."""
+    batch_size = len(batch)
+    max_length = max(len(item) for item in batch)
+    padded_batch = torch.zeros((max_length, batch_size), dtype=torch.long)
+    for i, item in enumerate(batch):
+        padded_batch[:len(item), i] = item
+    return padded_batch
 
-    print("====================================")
+
+vocab = {"<unk>": 0, "<pad>": 1, "hello": 2, "world": 3,
+         "!": 4, "goodbye": 5, "moon": 6, "sun": 7, "lol": 8, "how": 9, "are": 10, "you": 11, "doing": 12, "today": 13, "?": 14}
+data = [["hello", "world", "!"], ["hello", "!"], ["goodbye",
+                                                  "moon", "sun"], ["goodbye", "sun"], ["goodbye", "moon", "lol"], ["how", "are", "you", "doing", "today", "?"]]
+
+dataset = TokenizedTextDataset(data, vocab)
+print(dataset[0])
+print(dataset[1])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+data_loader = DataLoader(dataset, batch_size=2, collate_fn=collate_batch)
+ntokens = len(vocab)  # the size of vocabulary
+emsize = 200  # embedding dimension
+d_hid = 200  # dimension of the feedforward network model in ``nn.TransformerEncoder``
+nlayers = 2  # number of ``nn.TransformerEncoderLayer`` in ``nn.TransformerEncoder``
+nhead = 2  # number of heads in ``nn.MultiheadAttention``
+dropout = 0.2  # dropout probability
+model = TransformerModel(ntokens, emsize, nhead, d_hid,
+                         nlayers, dropout).to(device)
+
+criterion = nn.CrossEntropyLoss()
+lr = 1  # learning rate
+optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
+model.train()
+for batch in data_loader:
+    src = batch.to(device)
+    tgt = src
+    optimizer.zero_grad()
+    output = model(src)
+    loss = criterion(output.view(-1, ntokens), tgt.view(-1))
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    print(loss.item())
 # Test the model
-    print("Testing the model...")
-    print("====================================")
-    model.eval()  # Set the model to evaluation mode
-    with torch.no_grad():
-        X_test = X_test.to(device)
-        predictions = model(X_test)
-        predictions_cpu = predictions.cpu().numpy()
-        predictions = scaler_y.inverse_transform(predictions_cpu)  # Scale back the predictions
-        # Ensure y_test is on CPU and in NumPy format for comparison
-        y_test_cpu = y_test.cpu().numpy()
-        y_test = scaler_y.inverse_transform(y_test_cpu)
-        for i in range(10):
-            print(f'Predicted: High: {predictions[i][0]}, Low: {predictions[i][1]}, Close: {predictions[i][2]}')
-            print(f'Actual: High: {y_test[i][0]}, Low: {y_test[i][1]}, Close: {y_test[i][2]}')
+model.eval()
+word = "how are you".split()
+src = torch.tensor([[vocab[token] for token in word]],
+                   dtype=torch.long).to(device)
+output = model(src)
+print(output)
 
-    print("====================================")
+# convert to predictions
+_, predicted = torch.max(output, 2)
+predicted = predicted.cpu().numpy()
+predicted_words = [list(vocab.keys())[list(vocab.values()).index(
+    token)] for token in predicted[0]]
 
-# Evaluate the model
-    mse = mean_squared_error(y_test, predictions)
-    print(f'Mean Squared Error: {mse}')
-
-
-# Save the model
-    torch.save(model.state_dict(), f"./{modelId}_model.pth")
-
-
-def predict(date_str, open_price, previous_close,  previous_high, previous_low, modelId):
-    modelPath = "./" + modelId + "_model.pth"
-
-    scaler_X_path = (f"./{modelId}_scaler_X.pkl")
-    scaler_y_path = (f"./{modelId}_scaler_y.pkl")
-
-    # Load the scalers
-    scaler_X = joblib.load(scaler_X_path)
-    scaler_y = joblib.load(scaler_y_path)
-    # Load the model
-    model = Net()
-    model.load_state_dict(torch.load(modelPath))
-    model.eval()
-
-    # Convert the input data to the right format
-    date = pd.to_datetime(date_str, utc=True)
-    year = date.year
-    day_of_year = date.dayofyear
-
-    input_features = [[year, day_of_year, open_price,
-                       previous_close, previous_high, previous_low]]
-
-    input_features_scaled = scaler_X.transform(input_features)
-
-    X = torch.tensor(input_features_scaled, dtype=torch.float32).unsqueeze(0)
-
-    # Make the prediction
-
-    with torch.no_grad():
-        prediction = model(X)
-        # Remove the batch dimension and convert to numpy
-        prediction = prediction.squeeze().numpy()
-        # Now prediction is 2D and can be inverse transformed
-        prediction = scaler_y.inverse_transform([prediction])
-
-        return prediction[0][0], prediction[0][1], prediction[0][2]
-
-
-def __main__():
-    modelId = 'eth'
-    TrainNewModel('ETH_1min.csv', modelId)
-    
-    # Predict the next 10 days
-    """  start_date = '2024-04-04'
-    open_price = 170.29
-    previous_close = 169.65
-    plot = []
-    for i in range(1000):
-        high, low, close = predict(start_date, open_price, previous_close, previous_close, previous_close, modelName)
-        print(f'Predicted: High: {high}, Low: {low}, Close: {close}')
-        start_date = pd.to_datetime(start_date, utc=True) + pd.DateOffset(days=1)
-        start_date = start_date.strftime('%Y-%m-%d')
-        open_price = close
-        previous_close = close
-        plot.append([start_date, high, low, close])
-    
-    df = pd.DataFrame(plot, columns=['date', 'high', 'low', 'close'])
-    df.set_index('date', inplace=True)
-    df.plot()
-    
-    # display the plot
-    matplotlib.pyplot.show() """
-
-__main__()
+print(predicted_words)
